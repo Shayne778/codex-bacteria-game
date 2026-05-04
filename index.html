@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Antibiotic Arcade: Microbe Mayhem</title>
+  <style>
+    :root {
+      --bg: #0c0f29;
+      --panel: #171b44;
+      --accent: #53f6ff;
+      --text: #f4f7ff;
+      --danger: #ff4f70;
+      --good: #58ff9f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at top, #1a1e52, var(--bg) 55%);
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+    #wrap { position: relative; width: min(960px, 96vw); }
+    canvas {
+      width: 100%;
+      height: auto;
+      border: 4px solid #5cf2ff;
+      border-radius: 20px;
+      box-shadow: 0 0 30px rgba(83,246,255,.35), inset 0 0 40px rgba(255,255,255,.06);
+      background: linear-gradient(180deg, #10153b, #1a1d3d 45%, #161934);
+      image-rendering: auto;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="game" width="960" height="640"></canvas></div>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  const antibiotics = [
+    { key: '1', name: 'Penicillin', color: '#4ba3ff', shape: 'ring', moa: 'Blocks cell wall cross-linking (PBPs); best here for Streptococcus pyogenes.', hits: ['strep'] },
+    { key: '2', name: 'Vancomycin', color: '#cc8bff', shape: 'hex', moa: 'Binds D-Ala-D-Ala to block Gram-positive cell wall synthesis; target MRSA-like S. aureus.', hits: ['staph'] },
+    { key: '3', name: 'Ciprofloxacin', color: '#64ffb0', shape: 'twist', moa: 'Inhibits DNA gyrase/topoisomerase IV; useful here for E. coli and Pseudomonas.', hits: ['ecoli', 'pseudo'] },
+    { key: '4', name: 'Metronidazole', color: '#ffc259', shape: 'capsule', moa: 'Reduced in anaerobes to radical metabolites that damage DNA; target C. difficile.', hits: ['cdiff'] },
+    { key: '5', name: 'Isoniazid', color: '#ff5f66', shape: 'flame', moa: 'Prodrug that blocks mycolic acid synthesis in mycobacterial cell walls; target M. tuberculosis.', hits: ['mtb'] }
+  ];
+
+  const species = {
+    staph: { name: 'Staphylococcus aureus', color: '#ffc94d', hp: 1 },
+    ecoli: { name: 'Escherichia coli', color: '#ff8eb2', hp: 1 },
+    strep: { name: 'Streptococcus pyogenes', color: '#bc7dff', hp: 1 },
+    pseudo: { name: 'Pseudomonas aeruginosa', color: '#59ff85', hp: 1 },
+    mtb: { name: 'Mycobacterium tuberculosis', color: '#ff6b6b', hp: 1 },
+    cdiff: { name: 'Clostridium difficile', color: '#c69050', hp: 1 }
+  };
+
+  const spawnOrder = ['strep', 'staph', 'ecoli', 'pseudo', 'cdiff', 'mtb'];
+
+  let keys = {};
+  let mouse = { x: W/2, active: false, down: false };
+  let audioCtx;
+  const projectiles = [], enemies = [], particles = [], floaters = [];
+
+  const state = {
+    running: true,
+    start: performance.now(),
+    lastSpawn: 0,
+    score: 0,
+    health: 100,
+    selected: 0,
+    tooltipUntil: performance.now() + 4000,
+    level: 1,
+    nextLevelAt: 30000,
+    bossAlive: false,
+    neutralized: 0
+  };
+
+  const player = {
+    x: W/2,
+    y: H - 70,
+    w: 72,
+    h: 54,
+    speed: 420,
+    cd: 0
+  };
+
+  function beep(type='good') {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const t = audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    if (type === 'good') {
+      o.type = 'triangle'; o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(60, t + 0.12);
+      g.gain.setValueAtTime(0.2, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+    } else if (type === 'fire') {
+      o.type = 'square'; o.frequency.setValueAtTime(430, t);
+      g.gain.setValueAtTime(0.06, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+    } else {
+      o.type = 'sawtooth'; o.frequency.setValueAtTime(190, t); o.frequency.exponentialRampToValueAtTime(90, t + 0.2);
+      g.gain.setValueAtTime(0.17, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    }
+    o.start(t); o.stop(t + 0.25);
+  }
+
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function irand(a,b){ return Math.floor(rand(a,b+1)); }
+
+  function spawnEnemy(type, boss=false){
+    const sp = species[type];
+    enemies.push({
+      type,
+      x: rand(50, W-50),
+      y: -50,
+      vx: rand(-35, 35),
+      vy: rand(35, 70) + state.level * 8,
+      amp: rand(15, 48),
+      freq: rand(1.2, 2.5),
+      phase: rand(0, Math.PI*2),
+      hp: boss ? irand(2,3) : sp.hp,
+      maxHp: boss ? 3 : 1,
+      r: boss ? 56 : rand(18, 28),
+      resistantFlash: 0,
+      boss
+    });
+  }
+
+  function shoot(){
+    const a = antibiotics[state.selected];
+    projectiles.push({ x: player.x, y: player.y - 40, vy: -560, kind: state.selected, color: a.color, shape: a.shape, r: 11 });
+    beep('fire');
+  }
+
+  function emitLysis(x,y,color,count=22){
+    for(let i=0;i<count;i++) particles.push({ x, y, vx: rand(-180,180), vy: rand(-180,180), life: rand(0.35,0.8), t:0, color, size: rand(2,6) });
+  }
+
+  function markText(x,y,msg,color='#fff',life=1){ floaters.push({x,y,msg,color,life,t:0}); }
+
+  function update(dt, now){
+    if (!state.running) return;
+    if (now - state.start > state.nextLevelAt) {
+      state.level++;
+      state.nextLevelAt += 30000;
+      markText(W/2, 120, `Wave ${state.level}! New strain detected!`, '#53f6ff', 2);
+      if (state.level % 3 === 0 && !state.bossAlive) {
+        const t = Math.random() < .5 ? 'staph' : spawnOrder[Math.min(spawnOrder.length-1, state.level-1)];
+        spawnEnemy(t, true);
+        state.bossAlive = true;
+      }
+    }
+
+    if (keys.ArrowLeft) player.x -= player.speed * dt;
+    if (keys.ArrowRight) player.x += player.speed * dt;
+    if (mouse.active) player.x += (mouse.x - player.x) * Math.min(1, dt*12);
+    player.x = Math.max(40, Math.min(W-40, player.x));
+
+    player.cd -= dt;
+    const firing = keys[' '] || mouse.down;
+    if (firing && player.cd <= 0) { shoot(); player.cd = 0.18; }
+
+    const unlocked = Math.min(spawnOrder.length, 1 + Math.floor((now - state.start) / 30000));
+    if (now - state.lastSpawn > Math.max(350, 1200 - state.level*70)) {
+      spawnEnemy(spawnOrder[irand(0, unlocked-1)]);
+      state.lastSpawn = now;
+    }
+
+    for (let i=projectiles.length-1;i>=0;i--){
+      const p = projectiles[i]; p.y += p.vy*dt;
+      if (p.y < -30) projectiles.splice(i,1);
+    }
+
+    for (let i=enemies.length-1;i>=0;i--) {
+      const e = enemies[i];
+      e.phase += dt * e.freq;
+      e.x += (e.vx + Math.sin(e.phase)*e.amp) * dt;
+      e.y += e.vy * dt;
+      e.x = Math.max(e.r, Math.min(W-e.r, e.x));
+      if (e.resistantFlash > 0) e.resistantFlash -= dt;
+
+      for (let j=projectiles.length-1;j>=0;j--) {
+        const p = projectiles[j];
+        if ((p.x-e.x)**2 + (p.y-e.y)**2 < (e.r + p.r)**2) {
+          projectiles.splice(j,1);
+          const a = antibiotics[p.kind];
+          const correct = a.hits.includes(e.type);
+          if (correct) {
+            e.hp--; emitLysis(p.x, p.y, a.color, 10);
+            if (e.hp <= 0) {
+              state.score += e.boss ? 80 : 20;
+              state.neutralized++;
+              emitLysis(e.x, e.y, species[e.type].color, e.boss ? 120 : 40);
+              beep('good');
+              markText(e.x, e.y, e.boss ? 'BIOFILM DISRUPTED!' : 'LYSIS!', '#58ff9f', 0.9);
+              if (e.boss) state.bossAlive = false;
+              enemies.splice(i,1);
+            }
+          } else {
+            state.health -= 3;
+            e.resistantFlash = 0.35;
+            e.vy *= 1.18;
+            markText(e.x, e.y - e.r, 'RESISTANT!', '#ff4f70', 0.7);
+            beep('bad');
+          }
+          break;
+        }
+      }
+
+      if (e.y > H + e.r) {
+        state.health -= e.boss ? 20 : 10;
+        enemies.splice(i,1);
+        if (e.boss) state.bossAlive = false;
+      }
+    }
+
+    if (state.health <= 0) state.running = false;
+
+    for (let i=particles.length-1;i>=0;i--) {
+      const p = particles[i]; p.t += dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vx*=0.98; p.vy*=0.98;
+      if (p.t>p.life) particles.splice(i,1);
+    }
+    for (let i=floaters.length-1;i>=0;i--) {
+      const f = floaters[i]; f.t += dt; f.y -= 30*dt;
+      if (f.t>f.life) floaters.splice(i,1);
+    }
+  }
+
+  function drawBacteria(e){
+    ctx.save(); ctx.translate(e.x, e.y);
+    const flash = e.resistantFlash > 0 ? Math.sin(e.resistantFlash*60)>0 : false;
+    if (flash) ctx.globalAlpha = 0.4;
+    const c = species[e.type].color;
+    if (e.type==='staph') { for(let i=0;i<9;i++){const a=i/9*Math.PI*2;circle(Math.cos(a)*e.r*.5, Math.sin(a)*e.r*.5, e.r*.28, c);} circle(0,0,e.r*.34,c); }
+    else if (e.type==='ecoli') { capsule(0,0,e.r*1.6,e.r*.8,c); for(let i=-1;i<=1;i++) line(e.r*.9, i*5, e.r*1.35, i*8+Math.sin(performance.now()/120+i)*4, '#ffd8e7',2); }
+    else if (e.type==='strep') { for(let i=-2;i<=2;i++) circle(i*e.r*.45, Math.sin(i+.6)*3, e.r*.26, c); }
+    else if (e.type==='pseudo') { capsule(0,0,e.r*1.7,e.r*.75,c); blob(-e.r*.25,0,e.r*.45,'#79ffb0'); }
+    else if (e.type==='mtb') { capsule(0,0,e.r*1.8,e.r*.65,c); ctx.strokeStyle='#ffd2d2'; ctx.lineWidth=2; ctx.strokeRect(-e.r*.55,-e.r*.18,e.r*1.1,e.r*.36); }
+    else if (e.type==='cdiff') { capsule(0,0,e.r*1.7,e.r*.78,c); circle(e.r*.7,0,e.r*.23,'#ffdfb6'); }
+    if (e.boss) { ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(0,0,e.r+6,0,Math.PI*2); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  function drawProjectile(p){
+    ctx.save(); ctx.translate(p.x,p.y); ctx.fillStyle=p.color; ctx.strokeStyle='#fff';
+    if (p.shape==='ring'){ ctx.lineWidth=3; ctx.beginPath(); ctx.arc(0,0,8,0,Math.PI*2); ctx.stroke(); ctx.beginPath(); ctx.arc(0,0,3,0,Math.PI*2); ctx.stroke(); }
+    else if (p.shape==='hex'){ poly(0,0,8,6,p.color); }
+    else if (p.shape==='twist'){ ctx.beginPath(); for(let i=-8;i<8;i++){ctx.lineTo(i,Math.sin(i*.7)*4);} ctx.strokeStyle=p.color; ctx.lineWidth=3; ctx.stroke(); }
+    else if (p.shape==='capsule'){ capsule(0,0,16,8,p.color); }
+    else if (p.shape==='flame'){ ctx.beginPath(); ctx.moveTo(0,-10); ctx.quadraticCurveTo(8,-2,0,10); ctx.quadraticCurveTo(-8,-2,0,-10); ctx.fill(); }
+    ctx.restore();
+  }
+
+  function rankFor(score){ if(score<250) return 'Lab Tech'; if(score<600) return 'Resident'; if(score<1100) return 'Attending'; return 'Fleming Himself'; }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    drawBackground();
+
+    particles.forEach(p=>{ctx.globalAlpha=1-p.t/p.life; circle(p.x,p.y,p.size,p.color); ctx.globalAlpha=1;});
+    enemies.forEach(drawBacteria);
+    projectiles.forEach(drawProjectile);
+
+    drawPlayer();
+    drawHUD();
+
+    floaters.forEach(f=>{ctx.globalAlpha=1-f.t/f.life; ctx.fillStyle=f.color; ctx.font='bold 20px Trebuchet MS'; ctx.textAlign='center'; ctx.fillText(f.msg,f.x,f.y); ctx.globalAlpha=1;});
+
+    if (!state.running) {
+      ctx.fillStyle='rgba(8,10,24,.84)'; ctx.fillRect(0,0,W,H);
+      ctx.textAlign='center';
+      ctx.fillStyle='#fff'; ctx.font='bold 48px Trebuchet MS'; ctx.fillText('GAME OVER', W/2, H/2-70);
+      ctx.font='bold 28px Trebuchet MS'; ctx.fillStyle='#53f6ff'; ctx.fillText(`Specimens neutralized: ${state.neutralized}`, W/2, H/2-15);
+      ctx.fillStyle='#58ff9f'; ctx.fillText(`Rank: ${rankFor(state.score)}`, W/2, H/2+30);
+      ctx.fillStyle='#ffcf70'; ctx.font='20px Trebuchet MS'; ctx.fillText('Press R to restart', W/2, H/2+78);
+    }
+  }
+
+  function drawBackground(){
+    ctx.save();
+    for(let y=0;y<H;y+=42){ctx.strokeStyle=`rgba(120,145,255,${0.08 + (y/H)*0.08})`; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y+Math.sin((performance.now()/1200)+y/70)*10); ctx.stroke();}
+    ctx.restore();
+  }
+
+  function drawPlayer(){
+    ctx.save(); ctx.translate(player.x, player.y);
+    capsule(0, 0, player.w, player.h*0.75, '#dff2ff');
+    ctx.fillStyle = antibiotics[state.selected].color;
+    ctx.fillRect(-7, -player.h*0.75, 14, 28);
+    ctx.fillStyle = '#9dc1df'; ctx.fillRect(-16, 10, 32, 10);
+    ctx.restore();
+  }
+
+  function drawHUD(){
+    const a = antibiotics[state.selected];
+    ctx.fillStyle='rgba(15,19,48,.72)'; ctx.fillRect(12,12,W-24,84);
+    ctx.strokeStyle='#53f6ff'; ctx.strokeRect(12,12,W-24,84);
+
+    ctx.fillStyle='#fff'; ctx.font='bold 22px Trebuchet MS'; ctx.textAlign='left';
+    ctx.fillText(`Antibiotic [${a.key}]: ${a.name}`, 24, 42);
+    ctx.fillText(`Score: ${state.score}`, 24, 72);
+
+    const bw = 260;
+    ctx.fillStyle='#2d315f'; ctx.fillRect(W-310,30,bw,20);
+    ctx.fillStyle= state.health > 45 ? '#58ff9f' : state.health > 20 ? '#ffcf70' : '#ff4f70';
+    ctx.fillRect(W-310,30,Math.max(0, bw*(state.health/100)),20);
+    ctx.strokeStyle='#fff'; ctx.strokeRect(W-310,30,bw,20);
+    ctx.fillStyle='#fff'; ctx.fillText('Petri Integrity', W-310, 68);
+
+    if (performance.now() < state.tooltipUntil) {
+      ctx.fillStyle='rgba(2,5,18,.75)'; ctx.fillRect(20, H-72, W-40, 44);
+      ctx.strokeStyle=a.color; ctx.strokeRect(20, H-72, W-40, 44);
+      ctx.fillStyle='#f4f7ff'; ctx.font='16px Trebuchet MS';
+      ctx.fillText(`Mechanism: ${a.moa}`, 30, H-44);
+    }
+  }
+
+  function circle(x,y,r,c){ ctx.fillStyle=c; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); }
+  function line(x1,y1,x2,y2,c,w=1){ ctx.strokeStyle=c; ctx.lineWidth=w; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
+  function capsule(x,y,w,h,c){ ctx.fillStyle=c; const r=h/2; ctx.beginPath(); ctx.moveTo(x-w/2+r,y-h/2); ctx.lineTo(x+w/2-r,y-h/2); ctx.arc(x+w/2-r,y,r,-Math.PI/2,Math.PI/2); ctx.lineTo(x-w/2+r,y+h/2); ctx.arc(x-w/2+r,y,r,Math.PI/2,-Math.PI/2); ctx.fill(); }
+  function poly(x,y,r,n,c){ ctx.fillStyle=c; ctx.beginPath(); for(let i=0;i<n;i++){const a=i/n*Math.PI*2-Math.PI/2; const px=x+Math.cos(a)*r, py=y+Math.sin(a)*r; i?ctx.lineTo(px,py):ctx.moveTo(px,py);} ctx.closePath(); ctx.fill(); }
+  function blob(x,y,r,c){ for(let i=0;i<6;i++) circle(x+rand(-r*.4,r*.4), y+rand(-r*.4,r*.4), rand(r*.35,r*.6), c); }
+
+  function reset(){
+    enemies.length=projectiles.length=particles.length=floaters.length=0;
+    Object.assign(state,{running:true,start:performance.now(),lastSpawn:0,score:0,health:100,selected:0,tooltipUntil:performance.now()+3500,level:1,nextLevelAt:30000,bossAlive:false,neutralized:0});
+    player.x = W/2;
+  }
+
+  window.addEventListener('keydown', e=>{
+    if (e.key === ' ') e.preventDefault();
+    keys[e.key] = true;
+    const idx = antibiotics.findIndex(a=>a.key===e.key);
+    if (idx>=0) { state.selected=idx; state.tooltipUntil=performance.now()+4500; }
+    if (!state.running && (e.key==='r' || e.key==='R')) reset();
+  });
+  window.addEventListener('keyup', e=> keys[e.key]=false);
+  canvas.addEventListener('mousemove', e=>{ const r=canvas.getBoundingClientRect(); mouse.x=(e.clientX-r.left)*(W/r.width); mouse.active=true; });
+  canvas.addEventListener('mouseleave', ()=> mouse.active=false);
+  canvas.addEventListener('mousedown', ()=>{ mouse.down=true; });
+  window.addEventListener('mouseup', ()=> mouse.down=false);
+  canvas.addEventListener('click', ()=> { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+
+  let last = performance.now();
+  function loop(now){ const dt=Math.min(0.033,(now-last)/1000); last=now; update(dt, now); draw(); requestAnimationFrame(loop); }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
